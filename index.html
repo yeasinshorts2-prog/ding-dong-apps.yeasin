@@ -1,11 +1,26 @@
+```html
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Ding Dong Apps - Android App Store</title>
+
+    <!-- Speed Optimization: Preconnect to Firebase & CDN servers immediately -->
+    <link rel="preconnect" href="https://www.gstatic.com" crossorigin>
+    <link rel="preconnect" href="https://firestore.googleapis.com" crossorigin>
+    <link rel="preconnect" href="https://identitytoolkit.googleapis.com" crossorigin>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+
+    <!-- Speed Optimization: Preload Firebase ES modules in parallel -->
+    <link rel="modulepreload" href="https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js">
+    <link rel="modulepreload" href="https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js">
+    <link rel="modulepreload" href="https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js">
+
     <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <!-- Speed Optimization: Defer JSZip so it never blocks initial page load -->
+    <script defer src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
         body {
@@ -34,6 +49,15 @@
         .no-scrollbar {
             -ms-overflow-style: none;
             scrollbar-width: none;
+        }
+        @keyframes shimmer {
+            0% { background-position: -200% 0; }
+            100% { background-position: 200% 0; }
+        }
+        .skeleton-box {
+            background: linear-gradient(90deg, rgba(30, 41, 59, 0.7) 25%, rgba(51, 65, 85, 0.85) 50%, rgba(30, 41, 59, 0.7) 75%);
+            background-size: 200% 100%;
+            animation: shimmer 1.4s infinite linear;
         }
     </style>
 </head>
@@ -137,7 +161,7 @@
         </div>
 
         <div id="appsGrid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
-            <!-- App cards injected here -->
+            <!-- App cards or skeleton loaders injected here -->
         </div>
 
         <!-- Empty State -->
@@ -422,6 +446,7 @@
         const ADMIN_PIN = "YEA123sin@#";
         const MAX_APK_SIZE_MB = 25;
         const CHUNK_SIZE_BYTES = 500 * 1024; // 500 KB binary -> ~667 KB Base64 (Safe for Firestore 1MB limit)
+        const APPS_CACHE_KEY = "ding_dong_apps_instant_cache_v1";
 
         let isAdminUnlocked = false;
         let selectedCategory = "All";
@@ -433,8 +458,38 @@
         const CATEGORIES = ["All", "Tools", "Games", "Social", "Entertainment", "Education", "Productivity"];
         const EMOJI_OPTIONS = ["📱", "🎮", "⚡", "🎵", "📚", "🛠️", "💬", "🎬", "📷", "🚀", "🔔", "🧠"];
 
-        // Clean empty list (no demo apps)
-        let apps = [];
+        // Instant Cache Helpers (0ms load on page open)
+        function loadCachedApps() {
+            try {
+                const raw = localStorage.getItem(APPS_CACHE_KEY);
+                if (!raw) return null;
+                const parsed = JSON.parse(raw);
+                return Array.isArray(parsed) ? parsed : null;
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function saveCachedApps(appsList) {
+            try {
+                // Only cache cloud-synced metadata (exclude any temporary local Blob objects)
+                const cleanList = appsList.map(function (a) {
+                    const copy = Object.assign({}, a);
+                    delete copy.localBlob;
+                    return copy;
+                });
+                localStorage.setItem(APPS_CACHE_KEY, JSON.stringify(cleanList));
+            } catch (e) {
+                // Ignore storage quota errors gracefully
+                console.warn("Cache save skipped:", e);
+            }
+        }
+
+        // Load cached apps immediately before even waiting for Firebase
+        const initialCachedApps = loadCachedApps();
+        let apps = initialCachedApps || [];
+        // Show skeleton loader only if there is no cache yet and cloud is still fetching
+        let isInitialLoading = initialCachedApps === null;
 
         // Cloud Database State
         let db = null;
@@ -454,6 +509,13 @@
         };
 
         const appId = typeof __app_id !== "undefined" ? __app_id : "ding-dong-apps";
+
+        // Start fetching Firebase modules IMMEDIATELY in parallel (do not wait for DOMContentLoaded)
+        const firebaseModulesPromise = Promise.all([
+            import("https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js"),
+            import("https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js"),
+            import("https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js")
+        ]);
 
         function setCloudStatus(text, dotColorClass) {
             const textEl = document.getElementById("cloudStatusText");
@@ -513,7 +575,6 @@
                         canvas.height = maxSize;
                         const ctx = canvas.getContext("2d");
 
-                        // Cover/contain fit with centered scaling
                         const scale = Math.min(maxSize / img.width, maxSize / img.height);
                         const w = img.width * scale;
                         const h = img.height * scale;
@@ -548,14 +609,12 @@
                     if (zipEntry.dir) return;
                     const lower = relativePath.toLowerCase();
 
-                    // Must be a raster image inside res/ (ignore 9-patch images)
                     if (!lower.startsWith("res/")) return;
                     if (!(lower.endsWith(".png") || lower.endsWith(".webp") || lower.endsWith(".jpg") || lower.endsWith(".jpeg"))) return;
                     if (lower.endsWith(".9.png")) return;
 
                     let score = 0;
 
-                    // Strongest match: standard Android launcher icons
                     if (/ic_launcher(_round)?\.(png|webp|jpg)$/.test(lower)) {
                         score += 100;
                     } else if (/ic_launcher/.test(lower) && !/background|monochrome/.test(lower)) {
@@ -568,13 +627,9 @@
                         return;
                     }
 
-                    // Prefer mipmap over drawable
                     if (lower.includes("mipmap")) score += 20;
-
-                    // Prefer foreground only if no full ic_launcher exists
                     if (lower.includes("foreground")) score -= 15;
 
-                    // Prefer higher density icons for crisp quality
                     if (lower.includes("xxxhdpi")) score += 30;
                     else if (lower.includes("xxhdpi")) score += 25;
                     else if (lower.includes("xhdpi")) score += 20;
@@ -588,12 +643,10 @@
                     return "";
                 }
 
-                // Sort by highest score first
                 candidates.sort(function (a, b) {
                     return b.score - a.score;
                 });
 
-                // Try top candidates until one decodes cleanly
                 for (let i = 0; i < Math.min(candidates.length, 5); i++) {
                     try {
                         const rawBlob = await candidates[i].entry.async("blob");
@@ -679,12 +732,10 @@
             subEl.textContent = "Size: " + formattedSize + " • Ready to upload";
             if (sizeInput) sizeInput.value = formattedSize;
 
-            // Auto-fill App Name if empty
             if (nameInput && !nameInput.value.trim()) {
                 nameInput.value = file.name.replace(/\.apk$/i, "").replace(/[-_]+/g, " ");
             }
 
-            // Extract real icon from APK
             updateIconPreviewUI("🔍 Extracting app icon from APK...");
             const foundIcon = await extractIconFromApk(file);
             if (foundIcon) {
@@ -697,7 +748,6 @@
             }
         }
 
-        // Convert a file slice (Blob) to Base64 string
         function readSliceAsBase64(blobSlice) {
             return new Promise(function (resolve, reject) {
                 const reader = new FileReader();
@@ -713,7 +763,6 @@
             });
         }
 
-        // Convert Base64 string back to Uint8Array for APK reconstruction
         function base64ToUint8Array(base64) {
             const binaryStr = atob(base64);
             const len = binaryStr.length;
@@ -831,7 +880,7 @@
         function renderIconMarkup(app) {
             const url = (app.iconUrl || "").trim();
             if (url.startsWith("http") || url.startsWith("data:image/")) {
-                return `<img src="${escapeHtml(url)}" alt="${escapeHtml(app.name)}" class="w-full h-full object-cover" onerror="this.outerHTML='<span>${escapeHtml(app.icon || "📱")}</span>'">`;
+                return `<img src="${escapeHtml(url)}" alt="${escapeHtml(app.name)}" class="w-full h-full object-cover" decoding="async" onerror="this.outerHTML='<span>${escapeHtml(app.icon || "📱")}</span>'">`;
             }
             return `<span>${escapeHtml(app.icon || "📱")}</span>`;
         }
@@ -846,6 +895,38 @@
             }
         }
 
+        // Render smooth skeleton placeholders only on first visit when cache is empty
+        function renderSkeletonCards(count) {
+            let html = "";
+            for (let i = 0; i < count; i++) {
+                html += `
+                <div class="app-card rounded-2xl p-5 flex flex-col justify-between">
+                    <div>
+                        <div class="flex items-start gap-3.5">
+                            <div class="w-14 h-14 rounded-2xl skeleton-box shrink-0"></div>
+                            <div class="flex-1 space-y-2 py-1">
+                                <div class="h-4 w-16 rounded-md skeleton-box"></div>
+                                <div class="h-5 w-3/4 rounded-md skeleton-box"></div>
+                                <div class="h-3 w-1/2 rounded-md skeleton-box"></div>
+                            </div>
+                        </div>
+                        <div class="mt-4 space-y-2">
+                            <div class="h-3 w-full rounded skeleton-box"></div>
+                            <div class="h-3 w-4/5 rounded skeleton-box"></div>
+                        </div>
+                    </div>
+                    <div class="mt-5 pt-3.5 border-t border-slate-800/80 flex items-center justify-between">
+                        <div class="h-4 w-12 rounded skeleton-box"></div>
+                        <div class="flex gap-2">
+                            <div class="h-8 w-16 rounded-xl skeleton-box"></div>
+                            <div class="h-8 w-20 rounded-xl skeleton-box"></div>
+                        </div>
+                    </div>
+                </div>`;
+            }
+            return html;
+        }
+
         function renderApps() {
             const grid = document.getElementById("appsGrid");
             const emptyState = document.getElementById("emptyState");
@@ -854,6 +935,14 @@
             const emptyResetBtn = document.getElementById("emptyResetBtn");
             const showingCount = document.getElementById("showingCount");
             if (!grid) return;
+
+            // If still waiting for first-ever Cloud load and no cache exists, show skeletons
+            if (isInitialLoading && apps.length === 0) {
+                emptyState.classList.add("hidden");
+                if (showingCount) showingCount.textContent = "Loading apps...";
+                grid.innerHTML = renderSkeletonCards(3);
+                return;
+            }
 
             const query = (document.getElementById("searchInput")?.value || "").toLowerCase().trim();
             const sortBy = document.getElementById("sortSelect")?.value || "newest";
@@ -1033,6 +1122,12 @@
                 return;
             }
 
+            // If user clicked download right from cache before Cloud finished connecting
+            if (app.storageType === "cloud_apk" && !isCloudMode) {
+                showToast("Connecting to Cloud... Please tap Download again in a second.", "info");
+                return;
+            }
+
             // Case 3: Legacy external URL fallback
             if (app.downloadUrl && app.downloadUrl.startsWith("http")) {
                 window.open(app.downloadUrl, "_blank", "noopener,noreferrer");
@@ -1114,7 +1209,6 @@
                     progressPercent.textContent = "100%";
                     showToast("APK uploaded & published live!", "success");
                 } else {
-                    // Offline local mode fallback
                     apps.unshift({
                         id: "local-" + Date.now(),
                         ...baseMeta,
@@ -1126,7 +1220,6 @@
                     showToast("APK added locally (Offline Mode).", "info");
                 }
 
-                // Reset form
                 document.getElementById("publishTab").reset();
                 selectedApkFile = null;
                 extractedIconDataUrl = "";
@@ -1191,11 +1284,9 @@
                     showToast("Deleting app and APK data...", "info");
                     const appsColRef = fsApi.collection(db, "artifacts", appId, "public", "data", "apps");
 
-                    // Delete main app document
                     const appDocRef = fsApi.doc(db, "artifacts", appId, "public", "data", "apps", idToDelete);
                     await fsApi.deleteDoc(appDocRef);
 
-                    // Clean up all associated APK chunks to save cloud storage
                     const chunksQuery = fsApi.query(appsColRef, fsApi.where("parentAppId", "==", idToDelete));
                     const chunkSnap = await fsApi.getDocs(chunksQuery);
                     const deletePromises = chunkSnap.docs.map(function (chunkDoc) {
@@ -1206,6 +1297,7 @@
                     showToast("App deleted completely from Cloud.", "success");
                 } else {
                     apps = apps.filter(function (a) { return a.id !== idToDelete; });
+                    saveCachedApps(apps);
                     renderApps();
                     updateHeroStats();
                     renderManageAppsList();
@@ -1217,7 +1309,7 @@
             }
         }
 
-        // Dynamic Firebase Cloud Initialization
+        // Fast Firebase Cloud Initialization
         async function initCloudStorage() {
             let firebaseConfig = EXTERNAL_FIREBASE_CONFIG;
             if (typeof __firebase_config !== "undefined" && __firebase_config) {
@@ -1230,6 +1322,7 @@
 
             if (!firebaseConfig) {
                 isCloudMode = false;
+                isInitialLoading = false;
                 setCloudStatus("Local Preview Mode", "bg-amber-400");
                 renderApps();
                 updateHeroStats();
@@ -1237,18 +1330,22 @@
             }
 
             try {
-                const [appMod, authMod, fsMod] = await Promise.all([
-                    import("https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js"),
-                    import("https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js"),
-                    import("https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js")
-                ]);
+                // Uses pre-started module downloads for faster startup
+                const [appMod, authMod, fsMod] = await firebaseModulesPromise;
 
                 fsApi = fsMod;
                 const firebaseApp = appMod.initializeApp(firebaseConfig);
                 auth = authMod.getAuth(firebaseApp);
                 db = fsMod.getFirestore(firebaseApp);
 
-                if (typeof __initial_auth_token !== "undefined" && __initial_auth_token) {
+                // Reuse cached auth session immediately if available (skips extra network round-trip)
+                if (typeof auth.authStateReady === "function") {
+                    await auth.authStateReady();
+                }
+
+                if (auth.currentUser) {
+                    currentUser = auth.currentUser;
+                } else if (typeof __initial_auth_token !== "undefined" && __initial_auth_token) {
                     const cred = await authMod.signInWithCustomToken(auth, __initial_auth_token);
                     currentUser = cred.user;
                 } else {
@@ -1264,21 +1361,24 @@
                 setCloudStatus("Live Cloud Synced", "bg-emerald-400");
 
                 const appsColRef = fsApi.collection(db, "artifacts", appId, "public", "data", "apps");
-                // Only listen to actual uploaded apps (ignores old demo apps & binary APK chunks)
                 const appsQuery = fsApi.query(appsColRef, fsApi.where("docType", "==", "app"));
 
                 fsApi.onSnapshot(
                     appsQuery,
                     function (snapshot) {
+                        isInitialLoading = false;
                         apps = snapshot.docs.map(function (d) {
                             return { id: d.id, ...d.data() };
                         });
+                        // Save fresh list to browser cache for 0ms instant load next time
+                        saveCachedApps(apps);
                         renderApps();
                         updateHeroStats();
                         renderManageAppsList();
                     },
                     function (error) {
                         console.error("Cloud sync error:", error);
+                        isInitialLoading = false;
                         setCloudStatus("Sync Error (Check Rules)", "bg-rose-400");
                         renderApps();
                         updateHeroStats();
@@ -1287,6 +1387,7 @@
             } catch (err) {
                 console.error("Cloud initialization failed:", err);
                 isCloudMode = false;
+                isInitialLoading = false;
                 setCloudStatus("Offline Mode", "bg-amber-400");
                 renderApps();
                 updateHeroStats();
@@ -1309,8 +1410,14 @@
                 }
             });
 
+            // Immediately render cached apps (0ms) or smooth skeletons
             renderApps();
             updateHeroStats();
+
+            if (apps.length > 0) {
+                setCloudStatus("Loaded Instantly • Syncing...", "bg-emerald-400 animate-pulse");
+            }
+
             initCloudStorage();
         }
 
@@ -1322,3 +1429,4 @@
     </script>
 </body>
 </html>
+```
